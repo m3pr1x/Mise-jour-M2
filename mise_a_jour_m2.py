@@ -1,6 +1,23 @@
 # ────────────────────────────────────────────────────────────
-# fichier : mise_a_jour_m2.py
+# fichier : appairage_m2_streamlit.py
 # ────────────────────────────────────────────────────────────
+"""Outil Streamlit d'appairage entre codes M2 et familles client.
+
+Trois lots de fichiers peuvent être glissés‑déposés :
+  1. Données N‑1     → colonnes : Référence client  |  Code M2 ancien
+  2. Données N       → colonnes : Référence client  |  Code M2 nouveau
+  3. Table d'appairage → colonnes : Code M2 ancien  |  Code famille client
+
+L'utilisateur renseigne la position (1‑indexée) des colonnes utiles pour chaque
+lot. Plusieurs fichiers peuvent être concaténés pour un même lot.
+
+Résultats produits :
+  • Fichier « appairage_M2_CodeFamilleClient_YYMMDD.csv » :
+      pour chaque M2_nouveau, le code famille client majoritaire (si connu).
+  • Fichier « M2_MisAJour_YYMMDD.csv » :
+      pour chaque M2_nouveau, le M2_ancien majoritaire (si connu).
+  • Visualisation du DataFrame fusionné (outer → Référence, puis outer → M2_ancien).
+"""
 from __future__ import annotations
 
 import csv
@@ -11,13 +28,14 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# ---------- Page ----------
-st.set_page_config("Mise à jour M2", "🛠️", layout="wide")
-st.title("🛠️  Mise à jour M2")
+# ────────────────────────────  Page  ────────────────────────────
+st.set_page_config("Appairage M2", "🛠️", layout="wide")
+st.title("🛠️  Appairage codes M2 / familles client")
 
-# ---------- Helpers ----------
+# ───────────────────────  Fonctions utilitaires  ───────────────────────
+
 def read_csv(buf: io.BytesIO) -> pd.DataFrame:
-    """Lecture robuste d'un CSV : essai de plusieurs encodages + détecteur de séparateur."""
+    """Lecture robuste d'un CSV : test de plusieurs encodages + détection de séparateur."""
     for enc in ("utf-8", "latin1", "cp1252"):
         buf.seek(0)
         try:
@@ -29,8 +47,9 @@ def read_csv(buf: io.BytesIO) -> pd.DataFrame:
             continue
     raise ValueError("Fichier CSV illisible")
 
+
 def read_any(upload) -> pd.DataFrame | None:
-    """Retourne un DataFrame depuis un UploadFile (csv / xlsx / xls)."""
+    """Retourne un DataFrame depuis un UploadFile (csv / xlsx / xls / parquet)."""
     name = upload.name.lower()
     suffix = Path(name).suffix
     if suffix == ".csv":
@@ -46,58 +65,63 @@ def read_any(upload) -> pd.DataFrame | None:
                 "Installe‑le puis relance l'application."
             )
             return None
+    if suffix == ".parquet":
+        return pd.read_parquet(upload)
     st.error(f"Extension non prise en charge : {suffix}")
     return None
 
+
 def to_m2_series(s: pd.Series) -> pd.Series:
+    """Normalise les codes M2 → chaîne sur 6 caractères (zéro‑padding)."""
     return s.astype(str).str.zfill(6)
 
-def add_cols(df: pd.DataFrame, ref_idx: int, m2_idx: int, label: str) -> pd.DataFrame:
+
+def add_cols(df: pd.DataFrame, ref_idx: int, m2_idx: int, ref_label: str, m2_label: str) -> pd.DataFrame:
+    """Ajoute deux colonnes normalisées pour la référence et le code M2."""
     out = df.copy()
-    out["RéférenceProduit"] = out.iloc[:, ref_idx - 1].astype(str)
-    out[label] = to_m2_series(out.iloc[:, m2_idx - 1])
+    out[ref_label] = out.iloc[:, ref_idx - 1].astype(str)
+    out[m2_label] = to_m2_series(out.iloc[:, m2_idx - 1])
     return out
 
-def safe_merge(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
-    """Outer‑merge en évitant la collision de colonnes homonymes (hors clé)."""
-    dup = {c: f"{c}_right" for c in right.columns if c in left.columns and c != "RéférenceProduit"}
-    return left.merge(right.rename(columns=dup), on="RéférenceProduit", how="outer")
-
-def build_final(df: pd.DataFrame, ent: str) -> pd.DataFrame:
-    return (
-        pd.DataFrame(
-            {
-                "M2": df["M2_nouveau"],
-                "Entreprise": ent,
-                "Code_famille_Client": df["Code_famille_Client"],
-            }
-        )
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
 
 def idx_ok(df: pd.DataFrame, idx: int) -> bool:
+    """Vérifie que l'index renseigné existe bien dans le DataFrame."""
     return 1 <= idx <= df.shape[1]
 
-# ---------- Configuration des 3 lots ----------
+
+# ──────────────────────  Configuration des lots  ──────────────────────
 LOTS = {
-    "cat": ("Catalogue interne",  "Idx Réf. produit", "Idx M2 actuelle"),
-    "hist":("Historique ventes",  "Idx Réf. produit", "Idx M2 dernière"),
-    "cli": ("Fichier client",     "Idx M2",           "Idx Code famille"),
+    "old": (
+        "Donnees N‑1",
+        "Idx Réf. client",
+        "Idx Code M2 ancien",
+    ),
+    "new": (
+        "Donnees N",
+        "Idx Réf. client",
+        "Idx Code M2 nouveau",
+    ),
+    "map": (
+        "Table d'appairage",
+        "Idx Code M2 ancien",
+        "Idx Code famille client",
+    ),
 }
 
+# Initialisation de la session
 for key in LOTS:
-    st.session_state.setdefault(f"{key}_files", [])   # liste d'UploadedFile déjà ajoutés
-    st.session_state.setdefault(f"{key}_names", [])   # juste les noms, pour éviter les doublons
+    st.session_state.setdefault(f"{key}_files", [])   # UploadedFile stockés
+    st.session_state.setdefault(f"{key}_names", [])   # noms de fichiers pour éviter doublons
 
+# Interface de chargement
 cols = st.columns(3)
 for (key, (title, lab_ref, lab_val)), col in zip(LOTS.items(), cols):
     with col:
         st.subheader(title)
         uploads = st.file_uploader(
-            "Glisser‑déposer / parcourir…",
+            "Glisser / déposer ou parcourir…",
             accept_multiple_files=True,
-            type=("csv", "xlsx", "xls"),
+            type=("csv", "xlsx", "xls", "parquet"),
             key=f"uploader_{key}",
         )
         if uploads:
@@ -114,106 +138,120 @@ for (key, (title, lab_ref, lab_val)), col in zip(LOTS.items(), cols):
         st.number_input(lab_val, 1, 50, 2, key=f"{key}_val")
         st.caption(f"{len(st.session_state[f'{key}_files'])} fichier(s) chargés")
 
-entreprise = st.text_input("Entreprise (en MAJUSCULES)").strip().upper()
-
-# ---------- Fusion / appairage ----------
-if st.button("🔗  Créer l'appairage M2 ➜ Code client"):
-    # Vérifications
+# ─────────────────────────────  Traitement  ─────────────────────────────
+if st.button("🔗  Lancer l'appairage"):
+    # Vérifications préliminaires
     if not all(st.session_state[f"{k}_files"] for k in LOTS):
-        st.warning("Charge d'abord les trois lots de données.")
-        st.stop()
-    if not entreprise:
-        st.warning("Renseigne le champ « Entreprise ».")
+        st.warning("Merci de charger les trois lots de données avant de continuer.")
         st.stop()
 
-    # Lecture des fichiers → DataFrames (on n'en garde pas la trace en session)
-    dfs = {}
+    # Lecture des fichiers → DataFrames
+    dfs: dict[str, list[pd.DataFrame]] = {}
     for key in LOTS:
         dfs[key] = [read_any(up) for up in st.session_state[f"{key}_files"]]
         if any(df is None for df in dfs[key]):
-            st.error("Erreur de lecture dans un des fichiers ; corrige puis réessaie.")
+            st.error("Erreur de lecture dans au moins un fichier ; corrige puis réessaie.")
             st.stop()
 
-    cat_raw  = pd.concat(dfs["cat"],  ignore_index=True).drop_duplicates()
-    hist_raw = pd.concat(dfs["hist"], ignore_index=True).drop_duplicates()
-    cli_raw  = pd.concat(dfs["cli"],  ignore_index=True).drop_duplicates()
+    old_raw = pd.concat(dfs["old"], ignore_index=True).drop_duplicates()
+    new_raw = pd.concat(dfs["new"], ignore_index=True).drop_duplicates()
+    map_raw = pd.concat(dfs["map"], ignore_index=True).drop_duplicates()
 
-    # Vérif des index
-    for df, key in ((cat_raw, "cat"), (hist_raw, "hist"), (cli_raw, "cli")):
+    # Vérification des index
+    for df, key in ((old_raw, "old"), (new_raw, "new"), (map_raw, "map")):
         if not idx_ok(df, st.session_state[f"{key}_ref"]) or not idx_ok(df, st.session_state[f"{key}_val"]):
             st.error(f"Index hors limites pour le lot {key.upper()}.")
             st.stop()
 
-    # Pré‑traitement
-    cat  = add_cols(cat_raw,  st.session_state["cat_ref"],  st.session_state["cat_val"],  "M2_nouveau")
-    hist = add_cols(hist_raw, st.session_state["hist_ref"], st.session_state["hist_val"], "M2_ancien")
+    # Pré‑traitement : normalisation des colonnes
+    old_df = add_cols(
+        old_raw,
+        st.session_state["old_ref"],
+        st.session_state["old_val"],
+        "Reference",
+        "M2_ancien",
+    )
 
-    cli_m2 = cli_raw.copy()
-    cli_m2["M2"] = to_m2_series(cli_m2.iloc[:, st.session_state["cli_ref"] - 1])
-    cli_m2["Code_famille_Client"] = cli_m2.iloc[:, st.session_state["cli_val"] - 1].astype(str)
-    cli_m2 = cli_m2[["M2", "Code_famille_Client"]]
+    new_df = add_cols(
+        new_raw,
+        st.session_state["new_ref"],
+        st.session_state["new_val"],
+        "Reference",
+        "M2_nouveau",
+    )
 
+    map_df = map_raw.copy()
+    map_df["M2_ancien"] = to_m2_series(map_df.iloc[:, st.session_state["map_ref"] - 1])
+    map_df["Code_famille_Client"] = map_df.iloc[:, st.session_state["map_val"] - 1].astype(str)
+    map_df = map_df[["M2_ancien", "Code_famille_Client"]]
+
+    # Fusions successives
     with st.spinner("Fusion des fichiers…"):
-        merged = safe_merge(cat, hist[["RéférenceProduit", "M2_ancien"]])
-        merged = merged.merge(
-            cli_m2,
-            left_on="M2_ancien",
-            right_on="M2",
-            how="left",
-            suffixes=("_cat", ""),
+        merged = new_df.merge(
+            old_df[["Reference", "M2_ancien"]],
+            on="Reference",
+            how="outer",
         )
-        if "M2_cat" in merged.columns:
-            merged.drop(columns=["M2_cat"], inplace=True)
 
-    # Complétion majoritaire
-    pre_assigned = merged["Code_famille_Client"].notna().sum()
-    freq = (
-        merged.dropna(subset=["Code_famille_Client"])
-        .groupby("M2_nouveau")["Code_famille_Client"]
-        .agg(lambda s: s.value_counts().idxmax())
+        merged = merged.merge(
+            map_df,
+            on="M2_ancien",
+            how="outer",
+        )
+
+    st.success("✅  Fusion terminée")
+    st.dataframe(merged.head())
+
+    # ──────────  Dataset 1 : M2_nouveau → Code famille client  ──────────
+    family_map = (
+        merged.groupby("M2_nouveau")["Code_famille_Client"]
+        .agg(lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA)
+        .reset_index()
+        .rename(columns={"Code_famille_Client": "Code_famille_Client_majoritaire"})
     )
 
-    merged["Code_famille_Client"] = merged.apply(
-        lambda r: freq.get(r["M2_nouveau"], pd.NA)
-        if pd.isna(r["Code_famille_Client"])
-        else r["Code_famille_Client"],
-        axis=1,
-    )
-    completed = merged["Code_famille_Client"].notna().sum() - pre_assigned
-
-    # Résumé texte
-    maj_list = [f"{m2} -> {code}" for m2, code in freq.items()]
-    missing_final = merged[merged["Code_famille_Client"].isna()]["M2_nouveau"].unique()
-
-    summary_txt = "\n".join(
-        [
-            f"M2 déjà codés : {pre_assigned}",
-            f"M2 complétés (majorité) : {completed}",
-            "",
-            "M2 ajoutés / code choisi :",
-            *maj_list,
-            "",
-            "M2 restants sans code :",
-            *missing_final.astype(str),
-        ]
+    # ──────────  Dataset 2 : M2_nouveau → M2_ancien majoritaire  ──────────
+    m2_map = (
+        merged.groupby("M2_nouveau")["M2_ancien"]
+        .agg(lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA)
+        .reset_index()
+        .rename(columns={"M2_ancien": "M2_ancien_majoritaire"})
     )
 
-    # DataFrame final
-    final_df = build_final(merged.drop_duplicates("M2_nouveau"), entreprise)
+    # Ajustement des colonnes pour respecter la nomenclature voulue
+    appairage_df = family_map.rename(
+        columns={
+            "M2_nouveau": "M2_nouveau",
+            "Code_famille_Client_majoritaire": "Code_famille_Client",
+        }
+    )
+
+    m2_update_df = m2_map.rename(
+        columns={
+            "M2_nouveau": "M2_nouveau",
+            "M2_ancien_majoritaire": "M2_ancien",
+        }
+    )[["M2_ancien", "M2_nouveau"]]
+
+    # ──────────  Téléchargements  ──────────
     dstr = datetime.today().strftime("%y%m%d")
 
-    st.success("✅  Appairage terminé")
-    st.dataframe(final_df.head())
-
     st.download_button(
-        "⬇️ Télécharger l'appairage (CSV)",
-        final_df.to_csv(index=False, sep=";"),
-        file_name=f"APPARIAGE_M2_{entreprise}_{dstr}.csv",
+        "⬇️ Télécharger l'appairage M2 → Code famille (CSV)",
+        appairage_df.to_csv(index=False, sep=";"),
+        file_name=f"appairage_M2_CodeFamilleClient_{dstr}.csv",
         mime="text/csv",
     )
+
     st.download_button(
-        "⬇️ Télécharger le rapport (TXT)",
-        summary_txt,
-        file_name=f"SUIVI_{entreprise}_{dstr}.txt",
-        mime="text/plain",
+        "⬇️ Télécharger la mise à jour M2 (CSV)",
+        m2_update_df.to_csv(index=False, sep=";"),
+        file_name=f"M2_MisAJour_{dstr}.csv",
+        mime="text/csv",
+    )
+
+    # ──────────  Résumé visuel  ──────────
+    st.markdown(
+        f"**{len(merged):,}** lignes après fusion — "
+        f"{appairage_df['Code_famille_Client'].notna().sum():,} codes famille déterminés"
     )
