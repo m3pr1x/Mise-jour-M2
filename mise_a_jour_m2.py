@@ -183,3 +183,37 @@ if st.button("🔗  Créer l'appairage M2 ➜ Code client"):
 
     # Résumé texte
     maj_list = [f"{m2} -> {code}" for m2, code in freq.items()]
+    missing_final = merged[merged["Code_famille_Client"].isna()]["M2_nouveau"].unique()
+
+    summary_txt = "\n".join(
+        [
+            f"M2 déjà codés : {pre_assigned}",
+            f"M2 complétés (majorité) : {completed}",
+            "",
+            "M2 ajoutés / code choisi :",
+            *maj_list,
+            "",
+            "M2 restants sans code :",
+            *missing_final.astype(str),
+        ]
+    )
+
+    # DataFrame final
+    final_df = build_final(merged.drop_duplicates("M2_nouveau"), entreprise)
+    dstr = datetime.today().strftime("%y%m%d")
+
+    st.success("✅  Appairage terminé")
+    st.dataframe(final_df.head())
+
+    st.download_button(
+        "⬇️ Télécharger l'appairage (CSV)",
+        final_df.to_csv(index=False, sep=";"),
+        file_name=f"APPARIAGE_M2_{entreprise}_{dstr}.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "⬇️ Télécharger le rapport (TXT)",
+        summary_txt,
+        file_name=f"SUIVI_{entreprise}_{dstr}.txt",
+        mime="text/plain",
+    )
