@@ -1,7 +1,7 @@
 # ────────────────────────────────────────────────────────────
 # fichier : appairage_m2_streamlit.py
 # ────────────────────────────────────────────────────────────
-"""Outil Streamlit d'appairage entre codes M2 et familles client.
+"""Outil Streamlit d'appairage entre codes M2 et familles client.
 
 Trois lots de fichiers peuvent être glissés‑déposés :
   1. Données N‑1     → colonnes : Référence client  |  Code M2 ancien
@@ -12,11 +12,15 @@ L'utilisateur renseigne la position (1‑indexée) des colonnes utiles pour chaq
 lot. Plusieurs fichiers peuvent être concaténés pour un même lot.
 
 Résultats produits :
-  • Fichier « appairage_M2_CodeFamilleClient_YYMMDD.csv » :
+  • Fichier « appairage_M2_CodeFamilleClient_YYMMDD.csv » :
       pour chaque M2_nouveau, le code famille client majoritaire (si connu).
-  • Fichier « M2_MisAJour_YYMMDD.csv » :
+  • Fichier « M2_MisAJour_YYMMDD.csv » :
       pour chaque M2_nouveau, le M2_ancien majoritaire (si connu).
   • Visualisation du DataFrame fusionné (outer → Référence, puis outer → M2_ancien).
+
+➡️  Correctif intégré : le bug « fichier vide au 2ᵉ run » est résolu en figeant
+    immédiatement le contenu binaire de chaque `UploadedFile` (via
+    `upload.getvalue()`) avant toute lecture.
 """
 from __future__ import annotations
 
@@ -34,8 +38,9 @@ st.title("🛠️  Appairage codes M2 / familles client")
 
 # ───────────────────────  Fonctions utilitaires  ───────────────────────
 
-def read_csv(buf: io.BytesIO) -> pd.DataFrame:
-    """Lecture robuste d'un CSV : test de plusieurs encodages + détection de séparateur."""
+
+def read_csv_buffer(buf: io.BytesIO) -> pd.DataFrame:
+    """Lecture robuste d'un CSV : détecte séparateur + essaie plusieurs encodages."""
     for enc in ("utf-8", "latin1", "cp1252"):
         buf.seek(0)
         try:
@@ -45,28 +50,57 @@ def read_csv(buf: io.BytesIO) -> pd.DataFrame:
             return pd.read_csv(buf, sep=sep, encoding=enc, engine="python", on_bad_lines="skip")
         except (UnicodeDecodeError, csv.Error, pd.errors.ParserError):
             continue
-    raise ValueError("Fichier CSV illisible")
+    raise ValueError("Fichier CSV illisible : encodage ou séparateur non reconnu.")
 
 
 def read_any(upload) -> pd.DataFrame | None:
-    """Retourne un DataFrame depuis un UploadFile (csv / xlsx / xls / parquet)."""
-    name = upload.name.lower()
-    suffix = Path(name).suffix
+    """Retourne un DataFrame depuis un UploadFile (CSV / Excel / Parquet).
+
+    ❗️ Correctif bug Streamlit :
+        - On fige le contenu binaire dès l'appel (`data = upload.getvalue()`)
+        - On travaille ensuite sur **notre** `BytesIO` réinitialisable → plus
+          de problème de curseur lors des reruns.
+    """
+    if upload is None:
+        return None
+
+    data: bytes = upload.getvalue()  # fige le contenu dans un buffer immuable
+    buf = io.BytesIO(data)           # crée un flux repositionnable
+    suffix = Path(upload.name.lower()).suffix
+
+    # CSV ----------------------------------------------------------------
     if suffix == ".csv":
-        return read_csv(upload)
-    if suffix == ".xlsx":
-        return pd.read_excel(upload, engine="openpyxl")
-    if suffix == ".xls":
         try:
-            return pd.read_excel(upload, engine="xlrd")
+            return read_csv_buffer(buf)
+        except ValueError as err:
+            st.error(str(err))
+            return None
+
+    # EXCEL --------------------------------------------------------------
+    if suffix in {".xlsx", ".xls"}:
+        buf.seek(0)
+        engine = "openpyxl" if suffix == ".xlsx" else "xlrd"
+        try:
+            return pd.read_excel(buf, engine=engine)
         except ImportError:
             st.error(
-                "Le format .xls nécessite le paquet `xlrd<2.0.0`.\n"
+                "Le format .xls nécessite le paquet `xlrd<2.0.0`. "
                 "Installe‑le puis relance l'application."
             )
             return None
+        except Exception as exc:  # garde‑fou supplémentaire
+            st.error(f"Erreur de lecture Excel : {exc}")
+            return None
+
+    # PARQUET ------------------------------------------------------------
     if suffix == ".parquet":
-        return pd.read_parquet(upload)
+        buf.seek(0)
+        try:
+            return pd.read_parquet(buf)
+        except Exception as exc:
+            st.error(f"Erreur de lecture Parquet : {exc}")
+            return None
+
     st.error(f"Extension non prise en charge : {suffix}")
     return None
 
@@ -92,12 +126,12 @@ def idx_ok(df: pd.DataFrame, idx: int) -> bool:
 # ──────────────────────  Configuration des lots  ──────────────────────
 LOTS = {
     "old": (
-        "Donnees N‑1",
+        "Données N‑1",
         "Idx Réf. client",
         "Idx Code M2 ancien",
     ),
     "new": (
-        "Donnees N",
+        "Données N",
         "Idx Réf. client",
         "Idx Code M2 nouveau",
     ),
@@ -108,18 +142,18 @@ LOTS = {
     ),
 }
 
-# Initialisation de la session
+# Initialisation de la session -----------------------------------------
 for key in LOTS:
     st.session_state.setdefault(f"{key}_files", [])   # UploadedFile stockés
-    st.session_state.setdefault(f"{key}_names", [])   # noms de fichiers pour éviter doublons
+    st.session_state.setdefault(f"{key}_names", [])   # noms pour éviter doublons
 
-# Interface de chargement
+# Interface de chargement ----------------------------------------------
 cols = st.columns(3)
 for (key, (title, lab_ref, lab_val)), col in zip(LOTS.items(), cols):
     with col:
         st.subheader(title)
         uploads = st.file_uploader(
-            "Glisser / déposer ou parcourir…",
+            "Glisser / déposer ou parcourir…",
             accept_multiple_files=True,
             type=("csv", "xlsx", "xls", "parquet"),
             key=f"uploader_{key}",
@@ -140,12 +174,12 @@ for (key, (title, lab_ref, lab_val)), col in zip(LOTS.items(), cols):
 
 # ─────────────────────────────  Traitement  ─────────────────────────────
 if st.button("🔗  Lancer l'appairage"):
-    # Vérifications préliminaires
+    # Vérifications préliminaires --------------------------------------
     if not all(st.session_state[f"{k}_files"] for k in LOTS):
         st.warning("Merci de charger les trois lots de données avant de continuer.")
         st.stop()
 
-    # Lecture des fichiers → DataFrames
+    # Lecture des fichiers → DataFrames --------------------------------
     dfs: dict[str, list[pd.DataFrame]] = {}
     for key in LOTS:
         dfs[key] = [read_any(up) for up in st.session_state[f"{key}_files"]]
@@ -157,13 +191,13 @@ if st.button("🔗  Lancer l'appairage"):
     new_raw = pd.concat(dfs["new"], ignore_index=True).drop_duplicates()
     map_raw = pd.concat(dfs["map"], ignore_index=True).drop_duplicates()
 
-    # Vérification des index
+    # Vérification des index -------------------------------------------
     for df, key in ((old_raw, "old"), (new_raw, "new"), (map_raw, "map")):
         if not idx_ok(df, st.session_state[f"{key}_ref"]) or not idx_ok(df, st.session_state[f"{key}_val"]):
             st.error(f"Index hors limites pour le lot {key.upper()}.")
             st.stop()
 
-    # Pré‑traitement : normalisation des colonnes
+    # Pré‑traitement : normalisation des colonnes ----------------------
     old_df = add_cols(
         old_raw,
         st.session_state["old_ref"],
@@ -185,14 +219,13 @@ if st.button("🔗  Lancer l'appairage"):
     map_df["Code_famille_Client"] = map_df.iloc[:, st.session_state["map_val"] - 1].astype(str)
     map_df = map_df[["M2_ancien", "Code_famille_Client"]]
 
-    # Fusions successives
+    # Fusions successives ---------------------------------------------
     with st.spinner("Fusion des fichiers…"):
         merged = new_df.merge(
             old_df[["Reference", "M2_ancien"]],
             on="Reference",
             how="outer",
         )
-
         merged = merged.merge(
             map_df,
             on="M2_ancien",
@@ -207,51 +240,17 @@ if st.button("🔗  Lancer l'appairage"):
         merged.groupby("M2_nouveau")["Code_famille_Client"]
         .agg(lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA)
         .reset_index()
-        .rename(columns={"Code_famille_Client": "Code_famille_Client_majoritaire"})
+        .rename(columns={"Code_famille_Client": "Code_famille_Client"})
     )
 
-    # ──────────  Dataset 2 : M2_nouveau → M2_ancien majoritaire  ──────────
+    # ──────────  Dataset 2 : M2_nouveau → M2_ancien majoritaire  ─────────
     m2_map = (
         merged.groupby("M2_nouveau")["M2_ancien"]
         .agg(lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA)
         .reset_index()
-        .rename(columns={"M2_ancien": "M2_ancien_majoritaire"})
+        .rename(columns={"M2_ancien": "M2_ancien"})
     )
 
-    # Ajustement des colonnes pour respecter la nomenclature voulue
-    appairage_df = family_map.rename(
-        columns={
-            "M2_nouveau": "M2_nouveau",
-            "Code_famille_Client_majoritaire": "Code_famille_Client",
-        }
-    )
-
-    m2_update_df = m2_map.rename(
-        columns={
-            "M2_nouveau": "M2_nouveau",
-            "M2_ancien_majoritaire": "M2_ancien",
-        }
-    )[["M2_ancien", "M2_nouveau"]]
-
-    # ──────────  Téléchargements  ──────────
-    dstr = datetime.today().strftime("%y%m%d")
-
-    st.download_button(
-        "⬇️ Télécharger l'appairage M2 → Code famille (CSV)",
-        appairage_df.to_csv(index=False, sep=";"),
-        file_name=f"appairage_M2_CodeFamilleClient_{dstr}.csv",
-        mime="text/csv",
-    )
-
-    st.download_button(
-        "⬇️ Télécharger la mise à jour M2 (CSV)",
-        m2_update_df.to_csv(index=False, sep=";"),
-        file_name=f"M2_MisAJour_{dstr}.csv",
-        mime="text/csv",
-    )
-
-    # ──────────  Résumé visuel  ──────────
-    st.markdown(
-        f"**{len(merged):,}** lignes après fusion — "
-        f"{appairage_df['Code_famille_Client'].notna().sum():,} codes famille déterminés"
-    )
+    # Ajustement des colonnes -----------------------------------------
+    appairage_df = family_map[["M2_nouveau", "Code_famille_Client"]]
+    m2_update_df = m2_map[["M2
