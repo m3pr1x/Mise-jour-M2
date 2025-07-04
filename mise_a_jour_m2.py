@@ -1,27 +1,14 @@
 # ────────────────────────────────────────────────────────────
-# fichier : appairage_m2_streamlit.py
+# fichier : appairage_m2_streamlit.py   (refonte 2025‑07‑04)
 # ────────────────────────────────────────────────────────────
-"""Outil Streamlit d'appairage entre codes M2 et familles client — version 2025‑07‑03.
+"""Streamlit : appairage codes M2 ⇆ familles client
 
-Nouveauté : **plus aucun bug de relecture** après un rerun !
------------------------------------------------------------
-Le problème provenait du fait que l’objet `UploadedFile` peut perdre sa
-référence au flux sous‑jacent après un rafraîchissement Streamlit. On fige donc
-*immédiatement* son contenu binaire (`bytes`) dans `st.session_state` — on ne
-stocke plus l’objet brut.
-
-Fonctionnement
-==============
-1. L’utilisateur dépose un ou plusieurs fichiers par lot.
-2. Chaque fichier est converti en dict `{"name": <str>, "bytes": <bytes>}` et
-   conservé en session.
-3. À chaque rerun, la lecture se fait **à partir des bytes** — jamais plus sur
-   l’objet Streamlit.
-
-Résultats produits :
-• `appairage_M2_CodeFamilleClient_YYMMDD.csv` : M2_nouveau → code famille client
-  (majoritaire).
-• `M2_MisAJour_YYMMDD.csv` : M2_nouveau → M2_ancien (majoritaire).
+• Lecture CSV/Excel robuste et **mise en cache** : première lecture → parse,
+  reruns suivants → DataFrame directement récupéré (plus de roue « en cours… »).
+• On ne stocke plus le flux binaire en mémoire ; on garde simplement
+  l’`UploadedFile` (objet Streamlit) + son nom pour éviter les doublons.
+• Limiteur d’échantillon facultatif pour le débogage (`SAMPLE_LIM` = nombre de
+  lignes max par lot ; mettre `None` pour désactiver).
 """
 from __future__ import annotations
 
@@ -29,25 +16,22 @@ import csv
 import io
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, List
+from typing import List
 
 import pandas as pd
 import streamlit as st
 
-# ────────────────────────────  Types  ────────────────────────────
-class StoredFile(TypedDict):
-    name: str
-    bytes: bytes
+# ═════════════════════════  PARAMÈTRES  ═════════════════════════
+SAMPLE_LIM: int | None = None   # ← mettre 10_000 en debug, None en prod
 
-
-# ────────────────────────────  Page  ────────────────────────────
+# ═════════════════════════  CONFIG UI  ═════════════════════════
 st.set_page_config("Appairage M2", "🛠️", layout="wide")
-st.title("🛠️  Appairage codes M2 / familles client")
+st.title("🛠️ Appairage codes M2 / familles client")
 
-# ───────────────────────  Fonctions utilitaires  ───────────────────────
+# ═════════════════════  FONCTIONS UTILITAIRES  ═══════════════════
 
-def read_csv_buffer(buf: io.BytesIO) -> pd.DataFrame:
-    """Essaye utf‑8, latin‑1, cp1252 + détection de séparateur."""
+def read_csv_buf(buf: io.BytesIO) -> pd.DataFrame:
+    """Détecte automatiquement encodage (utf‑8 / latin1 / cp1252) + séparateur."""
     for enc in ("utf-8", "latin1", "cp1252"):
         buf.seek(0)
         try:
@@ -55,140 +39,121 @@ def read_csv_buffer(buf: io.BytesIO) -> pd.DataFrame:
             sep = csv.Sniffer().sniff(sample, delimiters=";,|\t").delimiter
             buf.seek(0)
             return pd.read_csv(buf, sep=sep, encoding=enc, engine="python", on_bad_lines="skip")
-        except (UnicodeDecodeError, csv.Error, pd.errors.ParserError):
+        except (csv.Error, UnicodeDecodeError, pd.errors.ParserError):
             continue
-    raise ValueError("CSV illisible : encodage/separateur non reconnu.")
+    raise ValueError("CSV illisible : encodage ou séparateur non reconnu.")
 
 
-def read_any(file: StoredFile) -> pd.DataFrame | None:
-    """Retourne un DataFrame depuis un fichier stocké (dict name/bytes)."""
-    name = file["name"].lower()
-    data = file["bytes"]
-    buf = io.BytesIO(data)
-    suffix = Path(name).suffix
-
-    # CSV ----------------------------------------------------------------
+def parse_uploaded(file) -> pd.DataFrame:
+    """Lit un UploadedFile Streamlit en DataFrame (CSV / Excel / Parquet)."""
+    suffix = Path(file.name.lower()).suffix
     if suffix == ".csv":
-        try:
-            return read_csv_buffer(buf)
-        except ValueError as err:
-            st.error(f"{name} : {err}")
-            return None
-
-    # EXCEL --------------------------------------------------------------
+        return read_csv_buf(io.BytesIO(file.getvalue()))
     if suffix in {".xlsx", ".xls"}:
-        buf.seek(0)
+        file.seek(0)
         engine = "openpyxl" if suffix == ".xlsx" else "xlrd"
-        try:
-            return pd.read_excel(buf, engine=engine)
-        except ImportError:
-            st.error("Le format .xls nécessite `xlrd<2.0.0`. Installe‑le puis relance.")
-            return None
-        except Exception as exc:
-            st.error(f"Erreur Excel ({name}) : {exc}")
-            return None
-
-    # PARQUET ------------------------------------------------------------
+        return pd.read_excel(file, engine=engine)
     if suffix == ".parquet":
-        buf.seek(0)
-        try:
-            return pd.read_parquet(buf)
-        except Exception as exc:
-            st.error(f"Erreur Parquet ({name}) : {exc}")
-            return None
-
-    st.error(f"Extension non prise en charge : {suffix}")
-    return None
+        file.seek(0)
+        return pd.read_parquet(file)
+    raise ValueError(f"Extension non prise en charge : {suffix}")
 
 
-def to_m2_series(s: pd.Series) -> pd.Series:
+# mise en cache — clé = hash du nom + taille + mtime
+@st.cache_data(show_spinner=False)
+def load_df(file) -> pd.DataFrame | None:
+    try:
+        return parse_uploaded(file)
+    except Exception as err:
+        st.error(f"{file.name} : {err}")
+        return None
+
+
+def to_m2(s: pd.Series) -> pd.Series:
     return s.astype(str).str.zfill(6)
 
 
 def add_cols(df: pd.DataFrame, ref_idx: int, m2_idx: int, ref_label: str, m2_label: str) -> pd.DataFrame:
     out = df.copy()
     out[ref_label] = out.iloc[:, ref_idx - 1].astype(str)
-    out[m2_label] = to_m2_series(out.iloc[:, m2_idx - 1])
+    out[m2_label] = to_m2(out.iloc[:, m2_idx - 1])
     return out
 
 
-def idx_ok(df: pd.DataFrame, idx: int) -> bool:
-    return 1 <= idx <= df.shape[1]
-
-
-# ──────────────────────  Configuration des lots  ──────────────────────
+# ═══════════════════  INTERFACE DE TÉLÉVERSEMENT  ════════════════════
 LOTS = {
-    "old": ("Données N‑1", "Idx Réf. client", "Idx Code M2 ancien"),
-    "new": ("Données N", "Idx Réf. client", "Idx Code M2 nouveau"),
-    "map": ("Table d'appairage", "Idx Code M2 ancien", "Idx Code famille client"),
+    "old": ("Données N‑1", "Idx Réf. client", "Idx M2 ancien"),
+    "new": ("Données N",   "Idx Réf. client", "Idx M2 nouveau"),
+    "map": ("Table appairage", "Idx M2 ancien", "Idx Code famille client"),
 }
 
-# -----------------------  Session State  ------------------------------
-for key in LOTS:
-    st.session_state.setdefault(f"{key}_files", [])   # type: List[StoredFile]
-    st.session_state.setdefault(f"{key}_names", [])
+for k in LOTS:
+    st.session_state.setdefault(f"{k}_files", [])   # type: List[st.runtime.uploaded_file_manager.UploadedFile]
+    st.session_state.setdefault(f"{k}_names", [])
 
-# ----------------------  Interface Upload  ----------------------------
 cols = st.columns(3)
 for (key, (title, lab_ref, lab_val)), col in zip(LOTS.items(), cols):
     with col:
         st.subheader(title)
-        uploads = st.file_uploader(
-            "Glisser / déposer ou parcourir…",
-            accept_multiple_files=True,
-            type=("csv", "xlsx", "xls", "parquet"),
-            key=f"uploader_{key}",
-        )
+        uploads = st.file_uploader("Ajouter fichier(s)…", accept_multiple_files=True,
+                                   type=("csv", "xlsx", "xls", "parquet"), key=f"uploader_{key}")
         if uploads:
             new = 0
             for up in uploads:
                 if up.name not in st.session_state[f"{key}_names"]:
-                    st.session_state[f"{key}_files"].append({"name": up.name, "bytes": up.getvalue()})
+                    st.session_state[f"{key}_files"].append(up)
                     st.session_state[f"{key}_names"].append(up.name)
                     new += 1
             if new:
-                st.success(f"{new} fichier(s) ajouté(s)")
+                st.success(f"{new} nouveau(x) fichier(s) accepté(s)")
 
         st.number_input(lab_ref, 1, 50, 1, key=f"{key}_ref")
         st.number_input(lab_val, 1, 50, 2, key=f"{key}_val")
-        st.caption(f"{len(st.session_state[f'{key}_files'])} fichier(s) chargés")
+        st.caption(f"{len(st.session_state[f'{key}_files'])} fichier(s) chargé(s)")
 
-# ─────────────────────────────  Traitement  ─────────────────────────────
-if st.button("🔗  Lancer l'appairage"):
-    # ---------- Vérifications ----------
+# ════════════════════════  TRAITEMENT  ════════════════════════
+if st.button("🔗 Lancer l'appairage"):
     if not all(st.session_state[f"{k}_files"] for k in LOTS):
-        st.warning("Merci de charger les trois lots de données avant de continuer.")
+        st.warning("Merci de charger les trois lots avant de continuer.")
         st.stop()
 
-    # ---------- Lecture fichiers ----------
-    dfs: dict[str, List[pd.DataFrame]] = {}
+    # ---------- Chargement + concat ----------
+    dfs: dict[str, list[pd.DataFrame]] = {}
     for key in LOTS:
-        dfs[key] = [read_any(f) for f in st.session_state[f"{key}_files"]]
+        with st.spinner(f"Lecture des fichiers {key.upper()}…"):
+            dfs[key] = [load_df(f) for f in st.session_state[f"{key}_files"]]
         if any(df is None for df in dfs[key]):
-            st.error("Erreur de lecture dans au moins un fichier — corrige puis réessaie.")
+            st.error("Erreur dans au moins un fichier — corrigez puis relancez.")
             st.stop()
 
     old_raw = pd.concat(dfs["old"], ignore_index=True).drop_duplicates()
     new_raw = pd.concat(dfs["new"], ignore_index=True).drop_duplicates()
     map_raw = pd.concat(dfs["map"], ignore_index=True).drop_duplicates()
 
+    # échantillon pour debug
+    if SAMPLE_LIM:
+        old_raw = old_raw.head(SAMPLE_LIM)
+        new_raw = new_raw.head(SAMPLE_LIM)
+        map_raw = map_raw.head(SAMPLE_LIM)
+
     # ---------- Vérif index ----------
     for df, key in ((old_raw, "old"), (new_raw, "new"), (map_raw, "map")):
-        if not idx_ok(df, st.session_state[f"{key}_ref"]) or not idx_ok(df, st.session_state[f"{key}_val"]):
-            st.error(f"Index hors limites pour le lot {key.upper()}.")
+        ref_i, val_i = st.session_state[f"{key}_ref"], st.session_state[f"{key}_val"]
+        if not (1 <= ref_i <= df.shape[1] and 1 <= val_i <= df.shape[1]):
+            st.error(f"Index hors plage dans le lot {key.upper()}.")
             st.stop()
 
-    # ---------- Pré‑traitement ----------
+    # ---------- Normalisation ----------
     old_df = add_cols(old_raw, st.session_state["old_ref"], st.session_state["old_val"], "Reference", "M2_ancien")
     new_df = add_cols(new_raw, st.session_state["new_ref"], st.session_state["new_val"], "Reference", "M2_nouveau")
 
     map_df = map_raw.copy()
-    map_df["M2_ancien"] = to_m2_series(map_df.iloc[:, st.session_state["map_ref"] - 1])
+    map_df["M2_ancien"] = to_m2(map_df.iloc[:, st.session_state["map_ref"] - 1])
     map_df["Code_famille_Client"] = map_df.iloc[:, st.session_state["map_val"] - 1].astype(str)
     map_df = map_df[["M2_ancien", "Code_famille_Client"]]
 
     # ---------- Fusions ----------
-    with st.spinner("Fusion en cours…"):
+    with st.spinner("Fusion des lots…"):
         merged = new_df.merge(old_df[["Reference", "M2_ancien"]], on="Reference", how="outer")
         merged = merged.merge(map_df, on="M2_ancien", how="outer")
 
@@ -201,7 +166,6 @@ if st.button("🔗  Lancer l'appairage"):
         .agg(lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA)
         .reset_index()
     )
-
     m2_map = (
         merged.groupby("M2_nouveau")["M2_ancien"]
         .agg(lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA)
@@ -213,10 +177,9 @@ if st.button("🔗  Lancer l'appairage"):
 
     # ---------- Téléchargements ----------
     dstr = datetime.today().strftime("%y%m%d")
-    st.download_button("⬇️ Appairage M2 → Famille", appairage_df.to_csv(index=False, sep=";"), file_name=f"appairage_M2_CodeFamilleClient_{dstr}.csv", mime="text/csv")
-    st.download_button("⬇️ Mise à jour M2", m2_update_df.to_csv(index=False, sep=";"), file_name=f"M2_MisAJour_{dstr}.csv", mime="text/csv")
+    st.download_button("⬇️ Appairage M2 → Famille", appairage_df.to_csv(index=False, sep=";"),
+                       file_name=f"appairage_M2_CodeFamilleClient_{dstr}.csv", mime="text/csv")
+    st.download_button("⬇️ Mise à jour M2", m2_update_df.to_csv(index=False, sep=";"),
+                       file_name=f"M2_MisAJour_{dstr}.csv", mime="text/csv")
 
-    st.markdown(
-        f"**{len(merged):,}** lignes fusionnées — "
-        f"codes famille déterminés pour **{appairage_df['Code_famille_Client'].notna().sum():,}** M2_nouveau"
-    )
+    st.markdown(f"**{len(merged):,}** lignes fusionnées — codes famille renseignés pour **{appairage_df['Code_famille_Client'].notna().sum():,}** M2_nouveau")
