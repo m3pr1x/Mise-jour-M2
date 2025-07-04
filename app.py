@@ -196,7 +196,10 @@ if page.startswith("Mise a jour M2 - Appairage"):
         )
         st.dataframe(st.session_state["cl_csv_appair"].head())
     if "cl_csv_missing" in st.session_state:
-        st.download_button(
+                st.download_button(
             "Télécharger a_remplir.csv",
             st.session_state["cl_csv_missing"].to_csv(index=False, sep=";"),
-            file
+            file_name=f"a_remplir_{TODAY}.csv",
+            mime="text/csv",
+            key="dl_missing",
+        )
