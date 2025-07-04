@@ -1,54 +1,42 @@
-# streamlit_app.py  —  Mise a jour M2 (PC) et Appairage client
+# streamlit_app.py  —  Mise a jour M2 (PC) + Appairage client
 from __future__ import annotations
-
-import csv
-import io
-import os
+import csv, io, os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
-
 import pandas as pd
 import streamlit as st
 
 try:
-    import psutil  # facultatif
+    import psutil            # facultatif
 except ModuleNotFoundError:
-    psutil = None  # la jauge RAM affichera "n/a"
+    psutil = None
 
-DEBUG_SAMPLE: int | None = None  # ex: 10000 pour debug
+DEBUG_SAMPLE: int | None = None   # ex : 10000
 
-# ---------- Configuration UI ----------
+# ---------------- UI ----------------
 st.set_page_config(page_title="Mise a jour M2", page_icon="🛠", layout="wide")
 page = st.sidebar.radio(
     "Navigation",
     ("Mise a jour M2 - PC", "Mise a jour M2 - Appairage client"),
 )
 
-# ---------- Fonctions utilitaires ----------
+# --------------- utilitaires ---------------
 def read_csv(buf: io.BytesIO) -> pd.DataFrame:
-    """Lecture CSV robuste avec detection encodage + separateur."""
     for enc in ("utf-8", "latin1", "cp1252"):
         buf.seek(0)
         try:
             sample = buf.read(2048).decode(enc, errors="ignore")
             sep = csv.Sniffer().sniff(sample, delimiters=";,|\t").delimiter
             buf.seek(0)
-            return pd.read_csv(
-                buf,
-                sep=sep,
-                encoding=enc,
-                dtype=str,
-                low_memory=True,
-                on_bad_lines="skip",
-            )
+            return pd.read_csv(buf, sep=sep, encoding=enc, dtype=str,
+                               low_memory=True, on_bad_lines="skip")
         except (csv.Error, UnicodeDecodeError, pd.errors.ParserError):
             continue
-    raise ValueError("CSV illisible (encodage ou separateur)")
+    raise ValueError("CSV illisible")
 
 @st.cache_data(show_spinner=False, hash_funcs={io.BytesIO: lambda _: None})
 def load_df(up) -> pd.DataFrame:
-    """UploadedFile -> DataFrame, mis en cache."""
     ext = Path(up.name.lower()).suffix
     buf = io.BytesIO(up.getvalue())
     if ext == ".csv":
@@ -56,25 +44,25 @@ def load_df(up) -> pd.DataFrame:
     if ext == ".xlsx":
         buf.seek(0)
         return pd.read_excel(buf, engine="openpyxl", dtype=str)
-    raise ValueError(f"Extension non supportee: {ext}")
+    raise ValueError(ext)
 
-def to_m2(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.zfill(6)
+def to_m2(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.zfill(6)
 
-def add_cols(df: pd.DataFrame, ref_idx: int, m2_idx: int,
-             ref_label: str, m2_label: str) -> pd.DataFrame:
-    out = df.iloc[:, [ref_idx - 1, m2_idx - 1]].copy()
-    out.columns = [ref_label, m2_label]
-    out[m2_label] = to_m2(out[m2_label])
+def add_cols(df: pd.DataFrame, ref_i: int, m2_i: int,
+             ref_lbl: str, m2_lbl: str) -> pd.DataFrame:
+    out = df.iloc[:, [ref_i-1, m2_i-1]].copy()
+    out.columns = [ref_lbl, m2_lbl]
+    out[m2_lbl] = to_m2(out[m2_lbl])
     return out
 
 def ram() -> str:
     if psutil is None:
         return "n/a"
-    mem = psutil.Process(os.getpid()).memory_info().rss / 1_048_576
-    return f"{mem:,.0f} Mo"
+    r = psutil.Process(os.getpid()).memory_info().rss / 1_048_576
+    return f"{r:,.0f} Mo"
 
-# ---------- Composant uploader ----------
+# --------------- uploader ---------------
 def uploader(prefix: str, lots: Dict[str, tuple[str, str, str]]):
     for k in lots:
         st.session_state.setdefault(f"{prefix}_{k}_files", [])
@@ -106,13 +94,13 @@ def uploader(prefix: str, lots: Dict[str, tuple[str, str, str]]):
                 f"{len(st.session_state[f'{prefix}_{k}_files'])} fichier(s) | RAM: {ram()}"
             )
 
-# ---------- Page 1 : Mise a jour M2 pour PC ----------
+# --------------- page PC ---------------
 if page.startswith("Mise a jour M2 - PC"):
     st.header("Mise a jour des codes M2 (Personal Catalogue)")
 
     LOTS_PC = {
         "old": ("Donnees N-1", "Ref produit", "M2 ancien"),
-        "new": ("Donnees N", "Ref produit", "M2 nouveau"),
+        "new": ("Donnees N",   "Ref produit", "M2 nouveau"),
     }
     uploader("pc", LOTS_PC)
 
@@ -139,27 +127,13 @@ if page.startswith("Mise a jour M2 - PC"):
                 st.error(f"Indices hors plage ({k}).")
                 st.stop()
 
-        old_df = add_cols(
-            dfs["old"],
-            st.session_state["pc_old_ref"],
-            st.session_state["pc_old_val"],
-            "Ref",
-            "M2_ancien",
-        )
-        new_df = add_cols(
-            dfs["new"],
-            st.session_state["pc_new_ref"],
-            st.session_state["pc_new_val"],
-            "Ref",
-            "M2_nouveau",
-        )
+        old_df = add_cols(dfs["old"], st.session_state["pc_old_ref"], st.session_state["pc_old_val"], "Ref", "M2_ancien")
+        new_df = add_cols(dfs["new"], st.session_state["pc_new_ref"], st.session_state["pc_new_val"], "Ref", "M2_nouveau")
 
         merged = new_df.merge(old_df[["Ref", "M2_ancien"]], on="Ref", how="left")
-        maj = (
-            merged.groupby("M2_nouveau")["M2_ancien"]
-            .agg(lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA)
-            .reset_index()
-        )
+        maj = merged.groupby("M2_nouveau")["M2_ancien"].agg(
+            lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA
+        ).reset_index()
 
         dstr = datetime.today().strftime("%y%m%d")
         st.download_button(
@@ -170,14 +144,14 @@ if page.startswith("Mise a jour M2 - PC"):
         )
         st.dataframe(maj.head())
 
-# ---------- Page 2 : Appairage client ----------
+# --------------- page Appairage ---------------
 if page.startswith("Mise a jour M2 - Appairage"):
     st.header("Appairage M2 / famille client")
 
     LOTS_CL = {
         "old": ("Donnees N-1", "Ref produit", "M2 ancien"),
-        "new": ("Donnees N", "Ref produit", "M2 nouveau"),
-        "map": ("Mapping", "M2 ancien", "Code famille client"),
+        "new": ("Donnees N",   "Ref produit", "M2 nouveau"),
+        "map": ("Mapping",     "M2 ancien",   "Code famille client"),
     }
     uploader("cl", LOTS_CL)
 
@@ -204,34 +178,40 @@ if page.startswith("Mise a jour M2 - Appairage"):
                 st.error(f"Indices hors plage ({k}).")
                 st.stop()
 
-        old_df = add_cols(
-            dfs["old"],
-            st.session_state["cl_old_ref"],
-            st.session_state["cl_old_val"],
-            "Ref",
-            "M2_ancien",
-        )
-        new_df = add_cols(
-            dfs["new"],
-            st.session_state["cl_new_ref"],
-            st.session_state["cl_new_val"],
-            "Ref",
-            "M2_nouveau",
-        )
+        old_df = add_cols(dfs["old"], st.session_state["cl_old_ref"], st.session_state["cl_old_val"], "Ref", "M2_ancien")
+        new_df = add_cols(dfs["new"], st.session_state["cl_new_ref"], st.session_state["cl_new_val"], "Ref", "M2_nouveau")
 
-        map_df = dfs["map"].iloc[
-            :, [st.session_state["cl_map_ref"] - 1, st.session_state["cl_map_val"] - 1]
-        ].copy()
+        map_df = dfs["map"].iloc[:, [st.session_state["cl_map_ref"]-1, st.session_state["cl_map_val"]-1]].copy()
         map_df.columns = ["M2_ancien", "Code_famille_Client"]
         map_df["M2_ancien"] = to_m2(map_df["M2_ancien"])
 
+        # zero‑padding aussi dans merged
+        old_df["M2_ancien"] = to_m2(old_df["M2_ancien"])
+
         merged = (
-            new_df.merge(old_df[["Ref", "M2_ancien"]], on="Ref", how="left")
+            new_df
+            .merge(old_df[["Ref", "M2_ancien"]], on="Ref", how="left")
             .merge(map_df, on="M2_ancien", how="left")
         )
 
-        fam = (
-            merged.groupby("M2_nouveau")["Code_famille_Client"]
-            .agg(lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA)
-            .reset_index()
+        fam = merged.groupby("M2_nouveau")["Code_famille_Client"].agg(
+            lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA
+        ).reset_index()
+
+        rel = merged.groupby("M2_nouveau")["M2_ancien"].agg(
+            lambda s: s.value_counts().idxmax() if s.notna().any() else pd.NA
+        ).reset_index()
+
+        dstr = datetime.today().strftime("%y%m%d")
+        st.download_button(
+            "Telecharger appairage M2_famille.csv",
+            fam.to_csv(index=False, sep=";"),
+            file_name=f"appairage_M2_CodeFamilleClient_{dstr}.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "Telecharger M2_MisAJour.csv",
+            rel.to_csv(index=False, sep=";"),
+            file_name=f"M2_MisAJour_{dstr}.csv",
+            mime="text/csv",
         )
